@@ -2,6 +2,8 @@
 
 `agent-review` is a local TypeScript CLI that reviews GitHub pull requests using `gh` for GitHub access and OpenAI for code review.
 
+For npm distribution, install the scoped package `@dharris-scw/ai-day-agent-reviewer`. It exposes the `agent-review` command.
+
 It is designed for a single authenticated user running it from their own machine. In `--dry-run` mode it prints the exact GitHub review payloads it would submit without posting anything.
 
 ## What It Does
@@ -27,7 +29,7 @@ Automatic queue discovery only picks up PRs that are:
 Explicit targeting bypasses those queue rules:
 
 ```bash
-node dist/src/index.js --repo owner/repo --pr 123 --dry-run --model gpt-4.1-mini
+agent-review --repo owner/repo --pr 123 --dry-run --model gpt-4.1-mini
 ```
 
 That path still reviews the requested PR even if it is old, draft, or already reviewed.
@@ -53,11 +55,22 @@ export OPENAI_API_KEY=your_key_here
 export OPENAI_MODEL=gpt-4.1-mini
 ```
 
-## Install and Build
+## Install
 
 ```bash
-npm install
-npm run build
+npm install --global @dharris-scw/ai-day-agent-reviewer
+```
+
+After installation, run the CLI as:
+
+```bash
+agent-review --dry-run --model gpt-4.1-mini
+```
+
+If you prefer not to install globally, use the package with `npx`:
+
+```bash
+npx @dharris-scw/ai-day-agent-reviewer --dry-run --model gpt-4.1-mini
 ```
 
 ## Usage
@@ -65,25 +78,25 @@ npm run build
 Review the current queue without posting:
 
 ```bash
-node dist/src/index.js --dry-run --model gpt-4.1-mini
+agent-review --dry-run --model gpt-4.1-mini
 ```
 
 Review one specific PR:
 
 ```bash
-node dist/src/index.js --repo SecureCodeWarrior/platform --pr 9993 --dry-run --model gpt-4.1-mini
+agent-review --repo SecureCodeWarrior/platform --pr 9993 --dry-run --model gpt-4.1-mini
 ```
 
 Scope queue discovery to an org:
 
 ```bash
-node dist/src/index.js --org SecureCodeWarrior --dry-run --model gpt-4.1-mini
+agent-review --org SecureCodeWarrior --dry-run --model gpt-4.1-mini
 ```
 
 Run a real review submission:
 
 ```bash
-node dist/src/index.js --repo owner/repo --pr 123 --model gpt-4.1-mini
+agent-review --repo owner/repo --pr 123 --model gpt-4.1-mini
 ```
 
 ### Review Levels
@@ -95,7 +108,7 @@ node dist/src/index.js --repo owner/repo --pr 123 --model gpt-4.1-mini
 Example:
 
 ```bash
-node dist/src/index.js --repo owner/repo --pr 123 --dry-run --model gpt-4.1-mini --review-level normal
+agent-review --repo owner/repo --pr 123 --dry-run --model gpt-4.1-mini --review-level normal
 ```
 
 ## CLI Flags
@@ -119,7 +132,54 @@ node dist/src/index.js --repo owner/repo --pr 123 --dry-run --model gpt-4.1-mini
 - Large PRs are reviewed in reduced-coverage mode using the configured file/line guardrails.
 - If GitHub diff retrieval is too large, it falls back to the pull-files API.
 
+## Manual Release Preparation
+
+Use this checklist to prepare the npm release artifacts for `@dharris-scw/ai-day-agent-reviewer` without publishing anything:
+
+1. Update the release metadata in `package.json` in your release branch or worktree:
+   - set `"name"` to `@dharris-scw/ai-day-agent-reviewer`
+   - keep the `"bin"` entry exposing `agent-review`
+   - bump `"version"` for the intended release
+2. Rebuild the distributable files:
+
+```bash
+npm run build
+```
+
+3. Inspect the package contents that would be published:
+
+```bash
+npm pack --dry-run
+```
+
+4. Produce the tarball locally for handoff or smoke testing:
+
+```bash
+npm pack
+```
+
+5. Smoke test the packed artifact in a clean directory before publishing:
+
+```bash
+npm install --global ./dharris-scw-ai-day-agent-reviewer-<version>.tgz
+agent-review --help
+```
+
+Stop there. This flow prepares and validates the npm package but does not run `npm publish`.
+
 ## Development
+
+Install local dependencies:
+
+```bash
+npm install
+```
+
+Build:
+
+```bash
+npm run build
+```
 
 Typecheck:
 

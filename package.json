@@ -1,10 +1,33 @@
 {
-  "name": "agent-review",
+  "name": "@dharris-scw/ai-day-agent-reviewer",
   "version": "0.1.0",
   "description": "Autonomous GitHub PR review CLI",
   "type": "module",
+  "main": "./dist/src/index.js",
   "bin": {
     "agent-review": "./dist/src/index.js"
+  },
+  "files": [
+    "dist/src/"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dharris-scw/ai-day-agent-reviewer.git"
+  },
+  "homepage": "https://github.com/dharris-scw/ai-day-agent-reviewer#readme",
+  "bugs": {
+    "url": "https://github.com/dharris-scw/ai-day-agent-reviewer/issues"
+  },
+  "keywords": [
+    "agent",
+    "cli",
+    "code-review",
+    "github",
+    "pull-request"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
   },
   "engines": {
     "node": ">=20"
@@ -12,6 +35,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
+    "prepack": "npm run build",
     "test": "npm run build && node --test dist/test/**/*.test.js"
   },
   "devDependencies": {
