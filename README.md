@@ -8,7 +8,7 @@ It is designed for a single authenticated user running it from their own machine
 
 ## What It Does
 
-- Discovers pull requests requested for the current user
+- Discovers pull requests requested either directly for the current user or for GitHub teams the user belongs to
 - Clones each PR into a temporary workspace under `/tmp/agent-review`
 - Builds review context from the diff, changed files, and selected repository files
 - Calls OpenAI to generate structured findings
@@ -21,7 +21,7 @@ It is designed for a single authenticated user running it from their own machine
 Automatic queue discovery only picks up PRs that are:
 
 - open
-- review-requested for the current GitHub user
+- review-requested either directly for the current GitHub user or for a GitHub team the user belongs to
 - updated within the last 7 days
 - not draft
 - not already reviewed by the authenticated GitHub user

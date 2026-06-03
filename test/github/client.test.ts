@@ -31,6 +31,18 @@ class FakeRunner implements CommandRunner {
   }
 }
 
+function createLogger() {
+  const warnings: string[] = [];
+  return {
+    logger: {
+      warn(message: string) {
+        warnings.push(message);
+      },
+    },
+    warnings,
+  };
+}
+
 const pullRequest: PullRequestRef = {
   repository: {
     owner: 'acme',
@@ -175,6 +187,7 @@ test('submitReview dry-run returns exact gh payloads without executing POSTs', a
 });
 
 test('discoverPullRequests retries secondary rate limit failures', async () => {
+  const { logger } = createLogger();
   const rateLimited = new CommandExecutionError(
     'gh',
     ['search', 'prs'],
@@ -204,17 +217,24 @@ test('discoverPullRequests retries secondary rate limit failures', async () => {
       stderr: '',
       exitCode: 0,
     },
+    {
+      stdout: JSON.stringify([]),
+      stderr: '',
+      exitCode: 0,
+    },
   ]);
-  const client = new GitHubClient(runner);
+  const client = new GitHubClient(runner, logger);
 
   const result = await client.discoverPullRequests();
 
-  assert.equal(runner.calls.length, 3);
+  assert.equal(runner.calls.length, 4);
   assert.deepEqual(runner.calls[0]?.args, ['api', 'user']);
   assert.deepEqual(runner.calls[1]?.args, runner.calls[2]?.args);
+  assert.match(runner.calls[1]?.args.join(' '), /user-review-requested:@me/);
   assert.match(runner.calls[1]?.args.join(' '), /updated:>=\d{4}-\d{2}-\d{2}/);
   assert.match(runner.calls[1]?.args.join(' '), /-reviewed-by:reviewer/);
   assert.match(runner.calls[1]?.args.join(' '), /-is:draft/);
+  assert.deepEqual(runner.calls[3]?.args, ['api', 'user/teams', '--paginate', '--slurp']);
   assert.equal(result.length, 1);
   assert.equal(result[0]?.repository.owner, 'acme');
   assert.equal(result[0]?.number, 42);
@@ -237,6 +257,243 @@ test('resolveAuthenticatedLogin caches the gh api user lookup', async () => {
   assert.equal(second, 'reviewer');
   assert.equal(runner.calls.length, 1);
   assert.deepEqual(runner.calls[0]?.args, ['api', 'user']);
+});
+
+test('resolveAuthenticatedTeams parses visible team memberships from gh api', async () => {
+  const runner = new FakeRunner([
+    {
+      stdout: JSON.stringify([
+        [
+          {
+            slug: 'backend',
+            organization: { login: 'acme' },
+          },
+        ],
+        [
+          {
+            slug: 'frontend',
+            organization: { login: 'widgets' },
+          },
+          {
+            slug: '',
+            organization: { login: 'ignored' },
+          },
+        ],
+      ]),
+      stderr: '',
+      exitCode: 0,
+    },
+  ]);
+  const client = new GitHubClient(runner);
+
+  const teams = await client.resolveAuthenticatedTeams();
+
+  assert.deepEqual(teams, [
+    { organizationLogin: 'acme', slug: 'backend' },
+    { organizationLogin: 'widgets', slug: 'frontend' },
+  ]);
+  assert.deepEqual(runner.calls[0]?.args, ['api', 'user/teams', '--paginate', '--slurp']);
+});
+
+test('discoverPullRequests merges direct and team review requests and dedupes overlaps', async () => {
+  const runner = new FakeRunner([
+    {
+      stdout: JSON.stringify({ login: 'reviewer' }),
+      stderr: '',
+      exitCode: 0,
+    },
+    {
+      stdout: JSON.stringify([
+        {
+          number: 42,
+          title: 'Direct match',
+          url: 'https://github.com/acme/widget/pull/42',
+          repository: { nameWithOwner: 'acme/widget' },
+        },
+      ]),
+      stderr: '',
+      exitCode: 0,
+    },
+    {
+      stdout: JSON.stringify([
+        [
+          {
+            slug: 'backend',
+            organization: { login: 'acme' },
+          },
+        ],
+      ]),
+      stderr: '',
+      exitCode: 0,
+    },
+    {
+      stdout: JSON.stringify([
+        {
+          number: 42,
+          title: 'Team duplicate',
+          url: 'https://github.com/acme/widget/pull/42',
+          repository: { nameWithOwner: 'acme/widget' },
+        },
+        {
+          number: 77,
+          title: 'Team-only match',
+          url: 'https://github.com/acme/widget/pull/77',
+          repository: { nameWithOwner: 'acme/widget' },
+        },
+      ]),
+      stderr: '',
+      exitCode: 0,
+    },
+  ]);
+  const client = new GitHubClient(runner);
+
+  const result = await client.discoverPullRequests();
+
+  assert.equal(result.length, 2);
+  assert.deepEqual(
+    result.map((candidate) => candidate.number),
+    [42, 77],
+  );
+  assert.match(runner.calls[1]?.args.join(' '), /user-review-requested:@me/);
+  assert.match(runner.calls[3]?.args.join(' '), /team-review-requested:acme\/backend/);
+});
+
+test('discoverPullRequests narrows team searches with org and repo queue filters', async () => {
+  const runner = new FakeRunner([
+    {
+      stdout: JSON.stringify({ login: 'reviewer' }),
+      stderr: '',
+      exitCode: 0,
+    },
+    {
+      stdout: JSON.stringify([]),
+      stderr: '',
+      exitCode: 0,
+    },
+    {
+      stdout: JSON.stringify([
+        [
+          {
+            slug: 'backend',
+            organization: { login: 'acme' },
+          },
+          {
+            slug: 'frontend',
+            organization: { login: 'widgets' },
+          },
+        ],
+      ]),
+      stderr: '',
+      exitCode: 0,
+    },
+    {
+      stdout: JSON.stringify([]),
+      stderr: '',
+      exitCode: 0,
+    },
+  ]);
+  const client = new GitHubClient(runner);
+
+  await client.discoverPullRequests({ org: 'acme', repo: 'acme/widget' });
+
+  assert.equal(runner.calls.length, 4);
+  assert.match(runner.calls[1]?.args.join(' '), /org:acme/);
+  assert.match(runner.calls[1]?.args.join(' '), /repo:acme\/widget/);
+  assert.match(runner.calls[3]?.args.join(' '), /team-review-requested:acme\/backend/);
+  assert.doesNotMatch(runner.calls[3]?.args.join(' '), /widgets\/frontend/);
+});
+
+test('discoverPullRequests falls back to direct-only discovery when team lookup fails', async () => {
+  const { logger, warnings } = createLogger();
+  const runner = new FakeRunner([
+    {
+      stdout: JSON.stringify({ login: 'reviewer' }),
+      stderr: '',
+      exitCode: 0,
+    },
+    {
+      stdout: JSON.stringify([
+        {
+          number: 42,
+          title: 'Direct match',
+          url: 'https://github.com/acme/widget/pull/42',
+          repository: { nameWithOwner: 'acme/widget' },
+        },
+      ]),
+      stderr: '',
+      exitCode: 0,
+    },
+    new CommandExecutionError('gh', ['api', 'user/teams', '--paginate', '--slurp'], undefined, {
+      stdout: '',
+      stderr: 'Resource not accessible by integration',
+      exitCode: 1,
+    }),
+  ]);
+  const client = new GitHubClient(runner, logger);
+
+  const result = await client.discoverPullRequests();
+
+  assert.deepEqual(result.map((candidate) => candidate.number), [42]);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0] ?? '', /continuing with direct review requests only/i);
+});
+
+test('discoverPullRequests continues when a single team search fails', async () => {
+  const { logger, warnings } = createLogger();
+  const runner = new FakeRunner([
+    {
+      stdout: JSON.stringify({ login: 'reviewer' }),
+      stderr: '',
+      exitCode: 0,
+    },
+    {
+      stdout: JSON.stringify([]),
+      stderr: '',
+      exitCode: 0,
+    },
+    {
+      stdout: JSON.stringify([
+        [
+          {
+            slug: 'backend',
+            organization: { login: 'acme' },
+          },
+          {
+            slug: 'frontend',
+            organization: { login: 'acme' },
+          },
+        ],
+      ]),
+      stderr: '',
+      exitCode: 0,
+    },
+    new CommandExecutionError('gh', ['search', 'prs'], undefined, {
+      stdout: '',
+      stderr: 'boom',
+      exitCode: 1,
+    }),
+    {
+      stdout: JSON.stringify([
+        {
+          number: 99,
+          title: 'Second team match',
+          url: 'https://github.com/acme/widget/pull/99',
+          repository: { nameWithOwner: 'acme/widget' },
+        },
+      ]),
+      stderr: '',
+      exitCode: 0,
+    },
+  ]);
+  const client = new GitHubClient(runner, logger);
+
+  const result = await client.discoverPullRequests();
+
+  assert.deepEqual(result.map((candidate) => candidate.number), [99]);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0] ?? '', /Unable to search pull requests for team acme\/backend/);
+  assert.match(runner.calls[3]?.args.join(' '), /team-review-requested:acme\/backend/);
+  assert.match(runner.calls[4]?.args.join(' '), /team-review-requested:acme\/frontend/);
 });
 
 test('getPullRequestDiff falls back to pull files API when the diff is too large', async () => {

@@ -19,6 +19,11 @@ export interface AuthenticatedGitHubUser {
   login: string;
 }
 
+export interface AuthenticatedGitHubTeam {
+  organizationLogin: string;
+  slug: string;
+}
+
 export interface PullRequestCandidate extends PullRequestRef {
   title: string;
   url: string;

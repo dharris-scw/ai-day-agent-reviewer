@@ -1,6 +1,7 @@
 import { CommandExecutionError, type CommandRunner, SpawnCommandRunner, runOrThrow } from '../shared/command.js';
 import { parseUnifiedDiff } from './diff.js';
 import type {
+  AuthenticatedGitHubTeam,
   AuthenticatedGitHubUser,
   ExistingReviewSummary,
   PreparedFileComment,
@@ -23,6 +24,10 @@ import type {
 const DEFAULT_HOST = 'github.com';
 const REVIEWED_HEAD_MARKER = 'agent-review:reviewed-head=';
 const QUEUE_DISCOVERY_UPDATED_WINDOW_DAYS = 7;
+
+interface GitHubClientLogger {
+  warn(message: string): void;
+}
 
 function repositoryFullName(repository: RepositoryRef): string {
   return `${repository.owner}/${repository.name}`;
@@ -90,6 +95,19 @@ function parseDiscoveryItem(item: any): PullRequestCandidate {
 function parseAuthenticatedUser(item: any): AuthenticatedGitHubUser {
   return {
     login: String(item?.login ?? ''),
+  };
+}
+
+function parseAuthenticatedTeam(item: any): AuthenticatedGitHubTeam | undefined {
+  const organizationLogin = String(item?.organization?.login ?? '').trim();
+  const slug = String(item?.slug ?? '').trim();
+  if (!organizationLogin || !slug) {
+    return undefined;
+  }
+
+  return {
+    organizationLogin,
+    slug,
   };
 }
 
@@ -182,6 +200,19 @@ function buildQueueDiscoveryUpdatedCutoff(now: Date = new Date()): string {
   return formatDateOnly(cutoff);
 }
 
+function buildQueueDiscoveryKey(candidate: PullRequestCandidate): string {
+  const host = candidate.repository.host ?? DEFAULT_HOST;
+  return `${host}/${candidate.repository.owner}/${candidate.repository.name}#${candidate.number}`;
+}
+
+function flattenPaginatedApiResponse(parsed: unknown): any[] {
+  if (Array.isArray(parsed)) {
+    return parsed.flatMap((item) => (Array.isArray(item) ? item : [item]));
+  }
+
+  return [];
+}
+
 async function runGhWithRetry(
   runner: CommandRunner,
   args: string[],
@@ -210,9 +241,11 @@ async function runGhWithRetry(
 export class GitHubClient {
   private runner: CommandRunner;
   private authenticatedLoginPromise?: Promise<string>;
+  private logger: GitHubClientLogger;
 
-  constructor(runner: CommandRunner = new SpawnCommandRunner()) {
+  constructor(runner: CommandRunner = new SpawnCommandRunner(), logger: GitHubClientLogger = console) {
     this.runner = runner;
+    this.logger = logger;
   }
 
   async resolveAuthenticatedLogin(): Promise<string> {
@@ -233,29 +266,18 @@ export class GitHubClient {
     return this.authenticatedLoginPromise;
   }
 
-  async discoverPullRequests(filters: PullRequestDiscoveryFilters = {}): Promise<PullRequestCandidate[]> {
-    const repoFilter = normalizeRepoInput(filters.repo);
-    const authenticatedLogin = await this.resolveAuthenticatedLogin();
-    const queryTerms = [
-      'is:open',
-      '-is:draft',
-      `updated:>=${buildQueueDiscoveryUpdatedCutoff()}`,
-      `-reviewed-by:${authenticatedLogin}`,
-    ];
-    if (filters.org) {
-      queryTerms.push(`org:${filters.org}`);
-    }
-    if (repoFilter) {
-      queryTerms.push(`repo:${repositoryFullName(repoFilter)}`);
-    }
-    if (filters.pr !== undefined) {
-      queryTerms.push(`number:${filters.pr}`);
-    }
+  async resolveAuthenticatedTeams(): Promise<AuthenticatedGitHubTeam[]> {
+    const stdout = await runGhWithRetry(this.runner, ['api', 'user/teams', '--paginate', '--slurp']);
+    const parsed = JSON.parse(stdout);
+    return flattenPaginatedApiResponse(parsed)
+      .map(parseAuthenticatedTeam)
+      .filter((team): team is AuthenticatedGitHubTeam => team !== undefined);
+  }
 
+  private async searchPullRequests(queryTerms: string[]): Promise<PullRequestCandidate[]> {
     const args = [
       'search',
       'prs',
-      '--review-requested=@me',
       '--state=open',
       '--json',
       'number,title,url,repository',
@@ -265,6 +287,73 @@ export class GitHubClient {
     const stdout = await runGhWithRetry(this.runner, args);
     const parsed = JSON.parse(stdout);
     return Array.isArray(parsed) ? parsed.map(parseDiscoveryItem) : [];
+  }
+
+  async discoverPullRequests(filters: PullRequestDiscoveryFilters = {}): Promise<PullRequestCandidate[]> {
+    const repoFilter = normalizeRepoInput(filters.repo);
+    const authenticatedLogin = await this.resolveAuthenticatedLogin();
+    const queueTerms = [
+      'is:open',
+      '-is:draft',
+      `updated:>=${buildQueueDiscoveryUpdatedCutoff()}`,
+      `-reviewed-by:${authenticatedLogin}`,
+    ];
+    if (filters.org) {
+      queueTerms.push(`org:${filters.org}`);
+    }
+    if (repoFilter) {
+      queueTerms.push(`repo:${repositoryFullName(repoFilter)}`);
+    }
+    if (filters.pr !== undefined) {
+      queueTerms.push(`number:${filters.pr}`);
+    }
+
+    const results = new Map<string, PullRequestCandidate>();
+    const directMatches = await this.searchPullRequests([
+      'user-review-requested:@me',
+      ...queueTerms,
+    ]);
+    for (const candidate of directMatches) {
+      results.set(buildQueueDiscoveryKey(candidate), candidate);
+    }
+
+    let teams: AuthenticatedGitHubTeam[] = [];
+    try {
+      teams = await this.resolveAuthenticatedTeams();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`Unable to resolve GitHub team memberships; continuing with direct review requests only. ${message}`);
+      return [...results.values()];
+    }
+
+    const scopedTeams = teams.filter((team) => {
+      if (filters.org && team.organizationLogin !== filters.org) {
+        return false;
+      }
+      if (repoFilter && team.organizationLogin !== repoFilter.owner) {
+        return false;
+      }
+      return true;
+    });
+
+    for (const team of scopedTeams) {
+      try {
+        const teamMatches = await this.searchPullRequests([
+          `team-review-requested:${team.organizationLogin}/${team.slug}`,
+          ...queueTerms,
+        ]);
+        for (const candidate of teamMatches) {
+          results.set(buildQueueDiscoveryKey(candidate), candidate);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.logger.warn(
+          `Unable to search pull requests for team ${team.organizationLogin}/${team.slug}; continuing with the remaining review queue. ${message}`
+        );
+      }
+    }
+
+    return [...results.values()];
   }
 
   async getPullRequestMetadata(pullRequest: PullRequestRef): Promise<PullRequestMetadata> {

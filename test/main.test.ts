@@ -226,6 +226,93 @@ test("queue discovery skips pull requests already reviewed by the current GitHub
   assert.match(output(), /Skipping acme\/widget#42; already reviewed by GitHub user Reviewer\./);
 });
 
+test("queue discovery processes pull requests discovered from team review requests", async () => {
+  const candidate = createCandidate();
+  const metadata = createMetadata();
+  const { stdout, output } = createStdout();
+
+  let diffRequested = false;
+  let reviewSubmitted = false;
+
+  const github = {
+    async resolveAuthenticatedLogin() {
+      return "reviewer";
+    },
+    async discoverPullRequests() {
+      return [candidate];
+    },
+    async getPullRequestMetadata() {
+      return metadata;
+    },
+    async getExistingReviews(): Promise<ExistingReviewSummary[]> {
+      return [];
+    },
+    buildSkipMetadata() {
+      return createSkipMetadata();
+    },
+    async getPullRequestDiff() {
+      diffRequested = true;
+      return "diff --git a/src/app.ts b/src/app.ts\n";
+    },
+    async submitReview() {
+      reviewSubmitted = true;
+      return createSubmission();
+    },
+  };
+
+  const stateStore = {
+    async getReviewedHeadSha() {
+      return undefined;
+    },
+    async shouldReview() {
+      return true;
+    },
+    async markReviewed() {
+      throw new Error("markReviewed should not be called in dry-run mode");
+    },
+  };
+
+  const workspaceManager = {
+    async withWorkspace<T>(_metadata: PullRequestMetadata, callback: (workspace: {
+      rootDir: string;
+      repoDir: string;
+      baseSha: string;
+      headSha: string;
+      cleanup(): Promise<void>;
+    }) => Promise<T>) {
+      return await callback({
+        rootDir: "/tmp/workspace",
+        repoDir: "/tmp/repo",
+        baseSha: "base-sha",
+        headSha: "head-sha",
+        async cleanup() {},
+      });
+    },
+  };
+
+  await runCli(["--dry-run"], env, {
+    github,
+    stateStore,
+    workspaceManager,
+    reviewModel: new StubReviewModel(),
+    buildReviewInput: async (): Promise<PullRequestReviewInput> => ({
+      owner: "acme",
+      repo: "widget",
+      title: "Example",
+      baseSha: "base-sha",
+      headSha: "head-sha",
+      changedFiles: [],
+      repositoryContext: [],
+    }),
+    reviewPullRequestFn: async () => createReviewResult(),
+    stdout,
+  });
+
+  assert.equal(diffRequested, true);
+  assert.equal(reviewSubmitted, true);
+  assert.match(output(), /acme\/widget#42: COMMENT \(0 findings\)/);
+});
+
 test("explicit repo and pr targeting still reviews old draft or already-reviewed pull requests", async () => {
   const candidate = createCandidate();
   const metadata = createMetadata({ isDraft: true });
