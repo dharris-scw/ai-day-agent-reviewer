@@ -4,7 +4,7 @@
 
 For npm distribution, install the scoped package `@dharris-scw/ai-day-agent-reviewer`. It exposes the `agent-review` command.
 
-It is designed for a single authenticated user running it from their own machine. In `--dry-run` mode it prints the exact GitHub review payloads it would submit without posting anything.
+It is designed for a single authenticated user running it from their own machine. In `--dry-run` mode it writes one timestamped JSON artifact at the end of the run in the repo root and reports the saved file path without posting anything.
 
 ## What It Does
 
@@ -13,7 +13,9 @@ It is designed for a single authenticated user running it from their own machine
 - Builds review context from the diff, changed files, and selected repository files
 - Calls OpenAI to generate structured findings
 - Calibrates and filters findings by review level
+- Shows visual review progress with a spinner and task list in TTY mode
 - Prepares inline comments plus a final review summary
+- Writes one aggregate dry-run review artifact as JSON in the repo root
 - Stores reviewed head SHAs in `~/.agent-review/state.json`
 
 ## Queue Discovery Rules
@@ -75,6 +77,8 @@ npx @dharris-scw/ai-day-agent-reviewer --dry-run --model gpt-4.1-mini
 
 ## Usage
 
+Dry runs keep terminal output concise and save the full review artifact to disk:
+
 Review the current queue without posting:
 
 ```bash
@@ -97,6 +101,25 @@ Run a real review submission:
 
 ```bash
 agent-review --repo owner/repo --pr 123 --model gpt-4.1-mini
+```
+
+### Dry-Run Output
+
+- TTY mode shows a spinner plus a live task list.
+- Non-TTY mode emits deterministic append-only snapshots for logs and tests.
+- Dry-run mode writes one file like `agent-review-dry-run-20260612-031415-016.json` in the repo root after all reviews finish.
+
+Example:
+
+```text
+/ Reviewing pull requests
+[>] Tighten validation around dry runs [widget#42]
+[ ] Refresh queue filters [gadget#7]
+
+[x] Tighten validation around dry runs [widget#42] (1 finding) - COMMENT
+[x] Refresh queue filters [gadget#7] (0 findings) - COMMENT
+
+findings written to /path/to/repo/agent-review-dry-run-20260612-031415-016.json
 ```
 
 ### Review Levels
@@ -124,11 +147,16 @@ agent-review --repo owner/repo --pr 123 --dry-run --model gpt-4.1-mini --review-
 - `--model gpt-4.1-mini`
 - `--review-level light|normal|deep`
 
+`--dry-run` writes one aggregate JSON review artifact to the current repo root at the end of the run and does not mark the PR head as reviewed in tool state.
+
 ## Behavior Notes
 
 - The tool never auto-approves by default.
 - It submits `REQUEST_CHANGES` only when surviving findings include `major` or `critical`.
 - It skips re-review when the current PR head SHA was already reviewed by this tool.
+- Skipped PRs remain visible in the task list with the skip reason.
+- TTY runs use an in-place spinner and task list; non-TTY runs use deterministic append-only snapshots.
+- Dry runs do not print raw payload JSON to stdout and do not mark reviewed state.
 - Large PRs are reviewed in reduced-coverage mode using the configured file/line guardrails.
 - If GitHub diff retrieval is too large, it falls back to the pull-files API.
 

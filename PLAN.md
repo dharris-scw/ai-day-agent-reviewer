@@ -1,57 +1,144 @@
-# Restrict Queue Discovery to Recent, Non-Draft, Not-Yet-Reviewed PRs
+# Visual CLI Progress and Dry-Run JSON Artifacts
 
 ## Summary
-- Change automatic PR queue discovery so it only picks up PRs that:
-  - are open
-  - are requested for the current reviewer
-  - were updated in the last 7 days
-  - are not in draft state
-  - have not already been reviewed by the current GitHub user
-- Apply these rules only to queue discovery. Keep explicit `--repo --pr` targeting unchanged so a specific PR can still be reviewed on demand, even if it is old, draft, or already reviewed.
-- Keep the existing tool-specific “already reviewed this head SHA” skip logic in place as a second layer.
+- Create a separate branch first, then implement a terminal UI layer for the CLI with:
+  - one global spinner while review work is active
+  - a task list keyed by PR label `owner/repo#number`
+  - per-task status updates for `queued`, `reviewing`, `skipped`, and `complete`
+  - completed review rows showing a tick plus a findings suffix, for example `acme/widget#42 (3 findings)`
+- Replace dry-run terminal payload dumping with per-PR timestamped JSON artifacts written to the repo root.
+- Update tests and README to reflect the new stdout contract and dry-run behavior.
 
 ## Key Changes
-- Tighten GitHub search discovery in the GitHub client.
-  - Add an `updated:>=YYYY-MM-DD` term for the last 7 days.
-  - Add a “not already reviewed by me” search qualifier to the `gh search prs` query.
-  - Preserve existing `org`, `repo`, and explicit PR-number filtering behavior.
-- Resolve the authenticated GitHub login once per run.
-  - Add a small GitHub client method that fetches the current user login via `gh api user`.
-  - Use that login for review-author comparisons in fallback skip logic.
-- Add safety-net filtering after metadata/review lookup.
-  - Skip any queued PR whose metadata reports `isDraft=true`.
-  - Skip any queued PR that already has at least one review authored by the current user, regardless of review state or whether it was posted by this tool.
-  - Keep the existing skip for “current head already reviewed by this tool” as an additional check.
-- Update runtime messages.
-  - Log explicit skip reasons for `draft` and `already reviewed by current user`.
-  - Keep “No pull requests to review” behavior, but it now reflects the narrower queue.
+- Create a new branch before any code changes.
+  - Default branch name: `feature/visual-cli-dry-run-artifacts`
+- Add a CLI renderer abstraction and move user-facing output behind it.
+  - Introduce a small internal module under `src/cli/` for terminal rendering.
+  - `runCli` remains the orchestration entrypoint, but it stops calling `stdout.write(...)` directly for review progress.
+  - Renderer supports two modes:
+    - TTY mode: redraw in place with spinner + live task list
+    - non-TTY mode: emit append-only plain text snapshots so tests and redirected output stay deterministic
+- Add explicit task state tracking in `src/main.ts`.
+  - Track one task per PR with:
+    - `id`: `owner/repo#number`
+    - `status`: `queued | reviewing | skipped | complete`
+    - `skipReason?`: `draft | reviewed-by-user | reviewed-head`
+    - `verdict?`: `COMMENT | REQUEST_CHANGES`
+    - `findingsCount?`
+    - `dryRunArtifactPath?`
+  - Create task rows as soon as PRs are discovered or explicitly targeted.
+  - Preserve row order by initial PR order even when `concurrency > 1`.
+- Spinner behavior.
+  - One global spinner is active while at least one task is `queued` or `reviewing`.
+  - Spinner label:
+    - explicit target: `Reviewing owner/repo#123`
+    - queue mode: `Reviewing pull requests`
+  - Spinner stops once all tasks are terminal.
+- Task list presentation.
+  - `queued`: neutral marker
+  - `reviewing`: active marker
+  - `skipped`: skipped marker plus short reason text
+  - `complete`: tick plus verdict and findings suffix
+  - Findings suffix formatting:
+    - `0 findings`
+    - `1 finding`
+    - `N findings`
+  - Skipped rows do not show verdict or findings suffix.
+- Keep skipped PRs in the visual list.
+  - Draft PR: show skipped row with `draft`
+  - Already reviewed by authenticated GitHub user: show skipped row with `already reviewed by current user`
+  - Current head already reviewed by this tool/state: show skipped row with `current head already reviewed`
+- Add a dry-run artifact writer.
+  - New internal utility under `src/cli/` or `src/shared/` writes files to the repo root.
+  - One file per reviewed PR in dry-run mode.
+  - Filename format:
+    - `agent-review-dry-run-<owner>-<repo>-pr-<number>-<timestamp>.json`
+  - Timestamp format:
+    - UTC, sortable, filesystem-safe: `YYYYMMDD-HHmmss-SSS`
+  - Slug owner/repo segments to alphanumeric, `.`, `_`, `-`, replacing others with `-`
+- Dry-run JSON schema.
+  - Write a valid JSON object with these top-level fields:
+    - `generatedAt`: ISO timestamp
+    - `mode`: `"dry-run"`
+    - `pullRequest`:
+      - `host`
+      - `owner`
+      - `repo`
+      - `number`
+      - `title`
+      - `url`
+      - `baseSha`
+      - `headSha`
+    - `review`:
+      - `reviewLevel`
+      - `verdict`
+      - `summary`
+      - `coverageNote`
+      - `topRisks`
+      - `severityCounts`
+      - `findingsCount`
+      - `findings`
+    - `submission`:
+      - `dryRun`
+      - `payloads`
+  - `review.findings` should store the normalized surviving findings actually used for submission:
+    - `path`
+    - `line`
+    - `severity`
+    - `title`
+    - `body`
+    - `category`
+- Dry-run runtime behavior.
+  - `GitHubClient.submitReview()` remains unchanged and still returns prepared payloads for dry runs.
+  - `runCli` assembles the full artifact object after `reviewPullRequest()` and `submitReview()`.
+  - Persist the JSON artifact before marking the task `complete`.
+  - Completed dry-run row should mention the saved filename/path in its rendered detail text.
+  - Do not print raw `submission.payloads` or findings JSON to stdout anymore.
+- State behavior remains unchanged.
+  - Real runs still call `stateStore.markReviewed(...)`.
+  - Dry runs still do not mark reviewed.
+- README updates.
+  - Replace statements saying dry run “prints the exact GitHub review payloads” with language saying it “writes a timestamped JSON artifact in the repo root”.
+  - Add a short example of the visual task list and a sample artifact filename.
 
 ## Public Interfaces
 - No new CLI flags.
-- No change to existing command shapes.
-- Internal type additions only:
-  - discovery filtering/types should carry the fixed 7-day cutoff
-  - review-skip logic should accept the authenticated user login
-  - skip metadata may be extended to expose “reviewed by current user” separately from “reviewed current head by this tool” if that improves clarity
+- No change to existing invocation forms.
+- Changed user-visible behavior:
+  - interactive review progress is visual instead of plain line-by-line
+  - dry-run saves a JSON artifact file instead of printing payloads to stdout
+  - dry-run output reports where the artifact was written
+- Internal additions:
+  - renderer interface
+  - task state type
+  - dry-run artifact type and writer utility
 
 ## Test Plan
-- GitHub client tests:
-  - discovery query includes the 7-day `updated:` constraint
-  - discovery query excludes PRs already reviewed by `@me`
-  - authenticated-user lookup parses the current login correctly
-  - existing discovery retry behavior still works
-- Main-flow tests:
-  - queue discovery skips draft PRs
-  - queue discovery skips PRs already reviewed by the current user
-  - queue discovery still skips PRs whose current head was already reviewed by this tool
-  - explicit `--repo --pr` still processes a draft, old, or already-reviewed PR
-  - skip messages identify whether the reason was `draft`, `already reviewed by current user`, or `current head already reviewed`
-- Regression tests:
-  - org/repo-scoped queue discovery still works
-  - no-PR behavior remains unchanged except for the narrower filter set
+- `test/main.test.ts`
+  - queue run with one PR shows task lifecycle and final completed row
+  - queue run skipped draft PR shows skipped row with draft reason
+  - queue run skipped already-reviewed PR shows skipped row with reviewed-by-user reason
+  - tool-reviewed current head still shows skipped row with reviewed-head reason
+  - explicit `--repo --pr` still reviews even if draft or already reviewed
+  - dry-run stdout does not contain raw payload JSON
+  - dry-run output includes saved artifact path/filename
+  - findings suffix renders correctly for `0`, `1`, and plural counts
+- New artifact writer tests
+  - writes one JSON file per PR
+  - filename contains repo/pr identity and timestamp
+  - written file parses as JSON
+  - JSON contains expected top-level fields and payloads
+- Renderer tests
+  - TTY rendering includes spinner and task rows
+  - non-TTY fallback is deterministic append-only output
+  - row order remains stable under concurrent completion
+- Existing GitHub client tests
+  - keep current dry-run payload tests unchanged, since payload generation behavior is not changing
+- README verification
+  - examples and dry-run description match the new behavior
 
 ## Assumptions
-- “Updated in the last week” means updated within the last 7 calendar days from the current run date.
-- “Reviewed by the current user” means any GitHub PR review already submitted by the authenticated `gh` user, not only reviews posted by this tool.
-- These restrictions apply only to automatic queue discovery, not explicit PR targeting.
-- Default behavior is fixed in code for now; no configurability is added in this change.
+- Implementation will use no extra dependency unless the existing code makes a tiny spinner dependency clearly preferable.
+- Artifacts are written to the repo root, not the user home state directory.
+- One dry-run PR produces one artifact file.
+- Branch creation will be part of the implementation turn, not this planning turn.

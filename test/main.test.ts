@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { runCli } from "../src/main.js";
 import type {
@@ -23,7 +26,7 @@ class StubReviewModel implements ReviewEngineModel {
   }
 }
 
-function createCandidate(): PullRequestCandidate {
+function createCandidate(overrides: Partial<PullRequestCandidate> = {}): PullRequestCandidate {
   return {
     repository: {
       owner: "acme",
@@ -33,11 +36,14 @@ function createCandidate(): PullRequestCandidate {
     number: 42,
     title: "Example",
     url: "https://github.com/acme/widget/pull/42",
+    ...overrides,
   };
 }
 
-function createMetadata(overrides: Partial<PullRequestMetadata> = {}): PullRequestMetadata {
-  const candidate = createCandidate();
+function createMetadata(
+  overrides: Partial<PullRequestMetadata> = {},
+  candidate: PullRequestCandidate = createCandidate(),
+): PullRequestMetadata {
   return {
     repository: candidate.repository,
     number: candidate.number,
@@ -64,7 +70,16 @@ function createSkipMetadata(overrides: Partial<{ alreadyReviewedCurrentHead: boo
   };
 }
 
-function createReviewResult(): ReviewResult {
+function createReviewResult(findingsCount = 0): ReviewResult {
+  const findings = Array.from({ length: findingsCount }, (_, index) => ({
+    path: "src/app.ts",
+    line: index + 1,
+    severity: "minor" as const,
+    title: `Finding ${index + 1}`,
+    body: `Body ${index + 1}`,
+    category: "maintainability",
+  }));
+
   return {
     coverage: {
       mode: "full",
@@ -74,39 +89,40 @@ function createReviewResult(): ReviewResult {
       totalFiles: 0,
       totalChangedLines: 0,
     },
-    findings: [],
+    findings,
     summary: {
       verdict: "COMMENT",
-      summary: "No blocking issues found.",
+      summary: findingsCount === 0 ? "No blocking issues found." : "Review completed with findings.",
       coverageNote: "Full coverage.",
       topRisks: [],
       severityCounts: {
         critical: 0,
         major: 0,
-        minor: 0,
+        minor: findingsCount,
         nitpick: 0,
       },
     },
   };
 }
 
-function createSubmission(): SubmitReviewResult {
+function createSubmission(candidate: PullRequestCandidate = createCandidate()): SubmitReviewResult {
   return {
     dryRun: true,
     payloads: [
       {
         method: "POST",
-        endpoint: "repos/acme/widget/pulls/42/reviews",
+        endpoint: `repos/${candidate.repository.owner}/${candidate.repository.name}/pulls/${candidate.number}/reviews`,
         body: { event: "COMMENT" },
       } satisfies PreparedReviewPayload,
     ],
   };
 }
 
-function createStdout() {
+function createStdout(isTTY = false) {
   const chunks: string[] = [];
   return {
     stdout: {
+      isTTY,
       write(chunk: string) {
         chunks.push(chunk);
         return true;
@@ -118,7 +134,27 @@ function createStdout() {
   };
 }
 
-test("queue discovery skips draft pull requests", async () => {
+function createWorkspaceManager() {
+  return {
+    async withWorkspace<T>(_metadata: PullRequestMetadata, callback: (workspace: {
+      rootDir: string;
+      repoDir: string;
+      baseSha: string;
+      headSha: string;
+      cleanup(): Promise<void>;
+    }) => Promise<T>) {
+      return await callback({
+        rootDir: "/tmp/workspace",
+        repoDir: "/tmp/repo",
+        baseSha: "base-sha",
+        headSha: "head-sha",
+        async cleanup() {},
+      });
+    },
+  };
+}
+
+test("queue discovery skips draft pull requests in the task list", async () => {
   const candidate = createCandidate();
   const { stdout, output } = createStdout();
 
@@ -130,7 +166,7 @@ test("queue discovery skips draft pull requests", async () => {
       return [candidate];
     },
     async getPullRequestMetadata() {
-      return createMetadata({ isDraft: true });
+      return createMetadata({ isDraft: true }, candidate);
     },
     async getExistingReviews(): Promise<ExistingReviewSummary[]> {
       throw new Error("getExistingReviews should not be called for draft queue PRs");
@@ -165,7 +201,7 @@ test("queue discovery skips draft pull requests", async () => {
     stdout,
   });
 
-  assert.match(output(), /Skipping acme\/widget#42; pull request is draft\./);
+  assert.match(output(), /\[-\] Example \[widget#42\] - draft/);
 });
 
 test("queue discovery skips pull requests already reviewed by the current GitHub user", async () => {
@@ -180,7 +216,7 @@ test("queue discovery skips pull requests already reviewed by the current GitHub
       return [candidate];
     },
     async getPullRequestMetadata() {
-      return createMetadata();
+      return createMetadata({}, candidate);
     },
     async getExistingReviews(): Promise<ExistingReviewSummary[]> {
       return [
@@ -223,13 +259,64 @@ test("queue discovery skips pull requests already reviewed by the current GitHub
     stdout,
   });
 
-  assert.match(output(), /Skipping acme\/widget#42; already reviewed by GitHub user Reviewer\./);
+  assert.match(output(), /\[-\] Example \[widget#42\] - already reviewed by current user/);
 });
 
-test("queue discovery processes pull requests discovered from team review requests", async () => {
+test("queue discovery skips pull requests whose current head is already reviewed", async () => {
   const candidate = createCandidate();
-  const metadata = createMetadata();
   const { stdout, output } = createStdout();
+
+  const github = {
+    async resolveAuthenticatedLogin() {
+      return "reviewer";
+    },
+    async discoverPullRequests() {
+      return [candidate];
+    },
+    async getPullRequestMetadata() {
+      return createMetadata({}, candidate);
+    },
+    async getExistingReviews(): Promise<ExistingReviewSummary[]> {
+      return [];
+    },
+    buildSkipMetadata() {
+      return createSkipMetadata({ alreadyReviewedCurrentHead: true });
+    },
+    async getPullRequestDiff() {
+      throw new Error("getPullRequestDiff should not be called for already-reviewed heads");
+    },
+    async submitReview() {
+      throw new Error("submitReview should not be called for already-reviewed heads");
+    },
+  };
+
+  const stateStore = {
+    async getReviewedHeadSha() {
+      return undefined;
+    },
+    async shouldReview() {
+      return false;
+    },
+    async markReviewed() {
+      throw new Error("markReviewed should not be called for skipped queue PRs");
+    },
+  };
+
+  await runCli([], env, {
+    github,
+    stateStore,
+    reviewModel: new StubReviewModel(),
+    stdout,
+  });
+
+  assert.match(output(), /\[-\] Example \[widget#42\] - current head already reviewed/);
+});
+
+test("queue discovery dry-run writes one aggregate artifact file and reports it at the end", async () => {
+  const candidate = createCandidate();
+  const metadata = createMetadata({}, candidate);
+  const { stdout, output } = createStdout();
+  const cwd = await mkdtemp(join(tmpdir(), "agent-review-main-"));
 
   let diffRequested = false;
   let reviewSubmitted = false;
@@ -256,7 +343,7 @@ test("queue discovery processes pull requests discovered from team review reques
     },
     async submitReview() {
       reviewSubmitted = true;
-      return createSubmission();
+      return createSubmission(candidate);
     },
   };
 
@@ -272,28 +359,10 @@ test("queue discovery processes pull requests discovered from team review reques
     },
   };
 
-  const workspaceManager = {
-    async withWorkspace<T>(_metadata: PullRequestMetadata, callback: (workspace: {
-      rootDir: string;
-      repoDir: string;
-      baseSha: string;
-      headSha: string;
-      cleanup(): Promise<void>;
-    }) => Promise<T>) {
-      return await callback({
-        rootDir: "/tmp/workspace",
-        repoDir: "/tmp/repo",
-        baseSha: "base-sha",
-        headSha: "head-sha",
-        async cleanup() {},
-      });
-    },
-  };
-
   await runCli(["--dry-run"], env, {
     github,
     stateStore,
-    workspaceManager,
+    workspaceManager: createWorkspaceManager(),
     reviewModel: new StubReviewModel(),
     buildReviewInput: async (): Promise<PullRequestReviewInput> => ({
       owner: "acme",
@@ -306,17 +375,35 @@ test("queue discovery processes pull requests discovered from team review reques
     }),
     reviewPullRequestFn: async () => createReviewResult(),
     stdout,
+    cwd,
+    now: () => new Date("2026-06-12T03:14:15.016Z"),
   });
 
   assert.equal(diffRequested, true);
   assert.equal(reviewSubmitted, true);
-  assert.match(output(), /acme\/widget#42: COMMENT \(0 findings\)/);
+  assert.doesNotMatch(output(), /repos\/acme\/widget\/pulls\/42\/reviews/);
+  assert.match(output(), /\[x\] Example \[widget#42\] \(0 findings\) - COMMENT/);
+  assert.match(output(), /findings written to .*agent-review-dry-run-20260612-031415-016\.json\n$/);
+
+  const artifactPath = join(
+    cwd,
+    "agent-review-dry-run-20260612-031415-016.json",
+  );
+  const raw = await readFile(artifactPath, "utf8");
+  const parsed = JSON.parse(raw);
+
+  assert.equal(parsed.mode, "dry-run");
+  assert.equal(parsed.reviewCount, 1);
+  assert.equal(parsed.reviews[0].pullRequest.number, 42);
+  assert.equal(parsed.reviews[0].review.findingsCount, 0);
+  assert.equal(parsed.reviews[0].submission.dryRun, true);
 });
 
 test("explicit repo and pr targeting still reviews old draft or already-reviewed pull requests", async () => {
   const candidate = createCandidate();
-  const metadata = createMetadata({ isDraft: true });
+  const metadata = createMetadata({ isDraft: true }, candidate);
   const { stdout, output } = createStdout();
+  const cwd = await mkdtemp(join(tmpdir(), "agent-review-explicit-"));
 
   let resolvedGitHubLogin = false;
   let diffRequested = false;
@@ -355,7 +442,7 @@ test("explicit repo and pr targeting still reviews old draft or already-reviewed
     },
     async submitReview() {
       reviewSubmitted = true;
-      return createSubmission();
+      return createSubmission(candidate);
     },
   };
 
@@ -406,12 +493,115 @@ test("explicit repo and pr targeting still reviews old draft or already-reviewed
     }),
     reviewPullRequestFn: async () => createReviewResult(),
     stdout,
+    cwd,
+    now: () => new Date("2026-06-12T03:14:15.016Z"),
   });
 
   assert.equal(resolvedGitHubLogin, false);
   assert.equal(workspaceUsed, true);
   assert.equal(diffRequested, true);
   assert.equal(reviewSubmitted, true);
-  assert.match(output(), /acme\/widget#42: COMMENT \(0 findings\)/);
-  assert.doesNotMatch(output(), /Skipping acme\/widget#42;/);
+  assert.match(output(), /\[x\] Example \[widget#42\] \(0 findings\) - COMMENT/);
+  assert.match(output(), /findings written to .*agent-review-dry-run-20260612-031415-016\.json\n$/);
+  assert.doesNotMatch(output(), /\[-\] Example \[widget#42\]/);
+});
+
+test("concurrent reviews preserve discovery order in the task list", async () => {
+  const first = createCandidate();
+  const second = createCandidate({
+    repository: {
+      owner: "acme",
+      name: "gadget",
+      host: "github.com",
+    },
+    number: 7,
+    title: "Second",
+    url: "https://github.com/acme/gadget/pull/7",
+  });
+  const { stdout, output } = createStdout();
+  const cwd = await mkdtemp(join(tmpdir(), "agent-review-concurrency-"));
+
+  const github = {
+    async resolveAuthenticatedLogin() {
+      return "reviewer";
+    },
+    async discoverPullRequests() {
+      return [first, second];
+    },
+    async getPullRequestMetadata(pullRequest: PullRequestRef) {
+      return pullRequest.number === first.number
+        ? createMetadata({}, first)
+        : createMetadata({}, second);
+    },
+    async getExistingReviews(): Promise<ExistingReviewSummary[]> {
+      return [];
+    },
+    buildSkipMetadata() {
+      return createSkipMetadata();
+    },
+    async getPullRequestDiff() {
+      return "diff --git a/src/app.ts b/src/app.ts\n";
+    },
+    async submitReview(input: { pullRequest: PullRequestRef }) {
+      return input.pullRequest.number === first.number
+        ? createSubmission(first)
+        : createSubmission(second);
+    },
+  };
+
+  const stateStore = {
+    async getReviewedHeadSha() {
+      return undefined;
+    },
+    async shouldReview() {
+      return true;
+    },
+    async markReviewed() {
+      throw new Error("markReviewed should not be called in dry-run mode");
+    },
+  };
+
+  await runCli(["--dry-run", "--concurrency", "2"], env, {
+    github,
+    stateStore,
+    workspaceManager: createWorkspaceManager(),
+    reviewModel: new StubReviewModel(),
+    buildReviewInput: async ({ metadata }): Promise<PullRequestReviewInput> => ({
+      owner: metadata.repository.owner,
+      repo: metadata.repository.name,
+      title: metadata.title,
+      baseSha: metadata.baseSha,
+      headSha: metadata.headSha,
+      changedFiles: [],
+      repositoryContext: [],
+    }),
+    reviewPullRequestFn: async (input) => {
+      if (input.repo === "widget") {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 20);
+        });
+        return createReviewResult(1);
+      }
+
+      return createReviewResult(2);
+    },
+    stdout,
+    cwd,
+    now: () => new Date("2026-06-12T03:14:15.016Z"),
+  });
+
+  const rendered = output();
+  const finalSnapshotMatch = rendered.match(
+    /\[x\] Example \[widget#42\] \(1 finding\) - COMMENT\n\[x\] Second \[gadget#7\] \(2 findings\) - COMMENT\n\nfindings written to [^\n]*agent-review-dry-run-20260612-031415-016\.json\n$/,
+  );
+
+  assert.ok(finalSnapshotMatch, rendered);
+
+  const artifactPath = join(cwd, "agent-review-dry-run-20260612-031415-016.json");
+  const raw = await readFile(artifactPath, "utf8");
+  const parsed = JSON.parse(raw);
+
+  assert.equal(parsed.reviewCount, 2);
+  assert.equal(parsed.reviews[0].pullRequest.number, 42);
+  assert.equal(parsed.reviews[1].pullRequest.number, 7);
 });
